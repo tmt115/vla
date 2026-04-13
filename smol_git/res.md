@@ -4,6 +4,44 @@
 
 A full inference port of `lerobot/smolvla_base` (450M parameters) from CPU PyTorch to AWS Trainium (trn1.2xl) using `torch_neuronx.trace`. The model runs at **28 ms per inference** — prefix pass once (6.5 ms) plus 10 Euler denoising steps (2.1 ms each).
 
+torch_neuronx.trace — compiled the two main inference subgraphs (NeuronSmolVLAPrefix and NeuronSmolVLADenoiseStep) into Neuron Executable File Format (NEFF). This is what actually runs on the Trainium hardware. You give it a module and example inputs, it traces the compute graph, compiles it to NeuronCore instructions, and locks in the static shapes.
+
+NxDI (NeuronX Distributed Inference) — provided two things:
+
+ColumnParallelLinear / RowParallelLinear — tensor-parallel replacements for nn.Linear. Every weight matrix in every block uses these instead of plain linear layers, so the model is already wired for multi-core tensor parallelism (tp_degree > 1) even though we ran at tp_degree=1.
+
+RotaryEmbedding — a Neuron-optimized RoPE implementation used in the VLM decoder layer (unit B). Replaced with a CPU fallback _FallbackRoPE when NxDI isn't initialized (e.g. during unit tests).
+
+Short version: NxDI gave us the building blocks that run efficiently on Neuron hardware. trace was the compiler that turned those blocks into actual hardware instructions.
+
+---
+
+### Why Trace
+
+---
+
+1. The two subgraphs don't fit NxDI's model pattern
+
+NxDI is designed around a specific inference abstraction — you subclass NeuronBaseModel, define a KV cache, register it with NeuronConfig, and let the framework handle paging, continuous batching, and token-by-token decoding. SmolVLA doesn't do any of that. It runs a fixed-length prefix pass once, then a fixed-length denoising loop. Forcing it into NxDI's model structure would have meant fighting the framework rather than using it.
+
+2. The expert layer attention is non-standard
+
+NxDI's attention primitives assume standard causal self-attention with a KV cache. The SmolVLA expert layers do something NxDI has no built-in support for — concatenating external prefix VLM KV tensors with the suffix's own KV before attending. torch_neuronx.trace doesn't care; it just traces whatever Python + PyTorch you give it.
+
+3. trace is lower friction for a novel architecture
+
+With trace you write normal PyTorch, run it on CPU to verify correctness, then hand it to the compiler. NxDI requires you to conform to its abstractions from the start. For a first port of an unusual architecture, trace let us validate correctness at each phase before worrying about the compilation layer.
+
+The honest tradeoff: using full NxDI would have given us continuous batching, dynamic sequence lengths, and better integration with the AWS inference serving stack. trace gives us none of that — shapes are completely static. For a robot policy running one action at a time, that's fine. For a production serving system handling variable batch sizes, you'd want to revisit.
+
+The reasons:
+
+- Batch size is always 1. One robot, one action at a time. NxDI's continuous batching gives you nothing.
+- Sequence lengths are fixed. 241 prefix tokens, 50 suffix tokens, always. NxDI's dynamic shape handling gives you nothing.
+- No token-by-token decoding. The denoising loop is a fixed 10-step Euler iteration, not autoregressive generation. NxDI's KV cache management gives you nothing.
+- The attention pattern is non-standard. NxDI can't express "concat external KV tensors then attend" without significant hacking.
+
+
 ---
 
 ## The Process, Phase by Phase
