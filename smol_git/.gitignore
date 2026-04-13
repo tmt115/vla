@@ -1,0 +1,17 @@
+# Compiled Neuron graphs (large binaries)
+compiled/
+*.neff
+
+# Unit test weight checkpoints
+tests/artifacts/
+
+# Neuron compiler artifacts
+PostSPMDPassesExecutionDuration.txt
+global_metric_store.json
+log-neuron-cc.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
