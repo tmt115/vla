@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Compiled NEFF artifacts (large, machine-specific)
+compiled/
+
+# Fake checkpoint created at runtime
+/tmp/fake_qwen3vl_ckpt/
+
+# Editor / OS
+.DS_Store
+*.swp
+.venv/
