@@ -115,7 +115,10 @@ Translating a model will involve the following phases. Some phases are more invo
 
 **Note**: Activate the environment before running any code `source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate`
 
-**Vision/multimodal routing:** If the target model accepts image inputs (for example `pixel_values`, aspect ratios, image chunks, vision masks), load and follow [reference/vlm_translation.md](reference/vlm_translation.md) first, then apply the phases below.
+**Routing:**
+- Text-only LLM → proceed directly to Phase 1 below
+- VLM (model accepts image inputs e.g. `pixel_values`, aspect ratios, vision masks) → read [reference/vlm_translation.md](reference/vlm_translation.md) first, then apply phases below
+- VLA (model has an action head in addition to VLM inputs) → read [reference/vlm_translation.md](reference/vlm_translation.md) first, then read [reference/action_head_translation.md](reference/action_head_translation.md), then apply phases below
 
 ---
 
@@ -222,6 +225,7 @@ Launch a `plan` subagent (thoroughness: "very thorough") with a prompt that inst
    - **VLM (scatter integration)**: [Pixtral](/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/pixtral/modeling_pixtral.py)
    - **VLM (cross-attention integration)**: [MLlama](/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/mllama/modeling_mllama.py)
    - **VLM (chunked vision flow)**: [Llama4](/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/llama4/modeling_llama4.py)
+   - **VLA (flow matching)**: [SmolVLA](https://github.com/huggingface/lerobot/blob/main/lerobot/common/policies/smolvla/)
    - **Other (dense text)**: [Llama](/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/llama/modeling_llama.py)
 
 3. **NxDI compatibility assessment.** For each block, explicitly state whether it maps cleanly to an NxDI primitive. NxDI is designed for standard autoregressive LLM inference — models that deviate from this pattern will require partial or full `torch_neuronx.trace()`. Non-standard patterns to watch for include: denoising or diffusion loops, flow matching, non-autoregressive generation, fused multi-model architectures, custom KV cache layouts, dynamic control flow, and task heads that output non-token tensors (e.g. actions, embeddings, class logits). Document which subgraphs should use NxDI primitives and which should use `torch_neuronx.trace()`. Do not silently fall back — every `trace()` usage must be explicitly justified in the plan.
@@ -242,6 +246,10 @@ Launch a `plan` subagent (thoroughness: "very thorough") with a prompt that inst
    Vision/multimodal additions:
    - Vision encoder subagent (patch embedding + vision transformer layers)
    - Cross-modal connector subagent (projection, resampler, etc.)
+
+   Action head (VLA only):
+   - Action head subagent (denoising wrapper + cross-attention conditioning +
+     timestep embedding) — follow reference/action_head_translation.md
 
    Non-standard inference (diffusion, flow matching, etc.):
    - Identify subgraph boundaries at natural static-shape boundaries
