@@ -26,10 +26,12 @@ noise/sampling config if present. Look for the following signals:
 - Config or imports reference a noise scheduler, flow matching, DDPM, or
   diffusion process
 - Further classify continuous heads by subtype:
-  - **Flow matching** (GR00T N1.6, SmolVLA) — interpolates linearly between noise
-    and data, noise schedule is a straight path, typically fewer denoising steps
-  - **DDPM-style** (π0) — fixed Markov chain with discrete timesteps, longer
-    denoising chains
+  - **Flow matching** (GR00T N1.6, SmolVLA, π0) — interpolates linearly between
+    noise and data, noise schedule is a straight path, typically fewer denoising
+    steps. All three confirmed flow matching models.
+  - **DDPM-style** — fixed Markov chain with discrete timesteps, longer denoising
+    chains. No major current VLA confirmed to use this — flag as unknown if
+    encountered and verify against the noise scheduler source before assuming.
   - **Regression MLP** — no denoising loop, directly regresses action from VLM
     features in a single forward pass
   - **ACT/CVAE** — encoder-decoder architecture, produces action chunks via
@@ -71,6 +73,18 @@ forward — the part that gets compiled to a NEFF. The N-step denoising loop liv
 outside this wrapper entirely, on the CPU side. This boundary is the most
 important architectural decision in the action head port and must be correct
 before writing any other code.
+
+Both `NeuronDenoisingWrapper` and `NeuronActionHeadBase` are defined in
+`scripts/neuron_action_head_base.py` in the skill directory. Import them from
+there — do not redefine them. Your job is to subclass them, not rewrite them:
+
+```python
+from scripts.neuron_action_head_base import (
+    NeuronDenoisingWrapper,
+    NeuronActionHeadBase,
+    ConditioningContract,
+)
+```
 
 ### 2.1 Compiled Graph Boundary
 
