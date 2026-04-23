@@ -50,6 +50,7 @@ import os
 import time
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
+# from cross_attention_kernel import cross_attention_kernel, get_tile_size
 
 import torch
 import torch.nn as nn
@@ -76,7 +77,13 @@ try:
 except ImportError:
     # CPU fallback — allows unit testing without Neuron hardware
     _NEURON_AVAILABLE = False
-    ModelWrapper = nn.Module
+
+    class ModelWrapper(nn.Module):
+        """Shim so NeuronDenoisingWrapper.__init__ can call super().__init__(config=..., model_cls=...)."""
+        def __init__(self, config=None, model_cls=None, **kwargs):
+            super().__init__()
+            self.model = None
+
     InferenceConfig = object
     NeuronConfig = object
     ModelBuilder = None
