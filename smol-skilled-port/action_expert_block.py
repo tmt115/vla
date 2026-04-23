@@ -301,6 +301,18 @@ class NeuronSmolVLADenoisingWrapper(NeuronDenoisingWrapper):
         # Pass **kwargs (e.g. assign=True from torch_neuronx internals) through to nn.Module.
         return nn.Module.load_state_dict(self, state_dict, strict=strict, **kwargs)
 
+    def input_generator(self):
+        # Override base class which reads from self.config.neuron_config — config is None
+        # here since we bypass NeuronDenoisingWrapper.__init__. Use constants directly.
+        return [(
+            torch.zeros(BATCH_SIZE, ACTION_CHUNK_SIZE, ACTION_DIM, dtype=torch.bfloat16),
+            torch.zeros(BATCH_SIZE, NUM_CONDITIONING_TOKENS, CONDITIONING_HIDDEN_SIZE,
+                        dtype=torch.bfloat16),
+            torch.zeros(BATCH_SIZE, TIMESTEP_EMBED_DIM, dtype=torch.bfloat16),
+            torch.zeros(BATCH_SIZE, 1, ACTION_CHUNK_SIZE, NUM_CONDITIONING_TOKENS,
+                        dtype=torch.int32),
+        )]
+
     def compile(self, save_path: str) -> None:
         """
         Compile the denoising wrapper to a NEFF.

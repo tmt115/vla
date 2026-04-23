@@ -217,25 +217,27 @@ def compile_expert(hf_sd: dict) -> str:
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, 'action_expert.pt')
 
-    # Build the action head; compile_denoiser() calls NeuronSmolVLADenoisingWrapper.compile()
-    # internally — trace() stays inside the ModelWrapper subclass per NxDI convention.
+    # Build wrapper and load HF weights BEFORE tracing — torch_neuronx.trace()
+    # bakes weights into the NEFF at trace time, so loading after is too late.
     action_head = NeuronSmolVLAActionHead(SmolVLAActionHeadConfig())
+    wrapper = NeuronSmolVLADenoisingWrapper().bfloat16().eval()
+
     mapping = get_hf_to_neuron_weight_mapping()
     expert_sd = {
-        neuron_key: hf_sd[hf_key]
+        neuron_key: hf_sd[hf_key].bfloat16()
         for hf_key, neuron_key in mapping.items()
         if hf_key in hf_sd
     }
-
-    # compile_denoiser() builds wrapper + calls wrapper.compile(save_path) internally
-    action_head.compile_denoiser(save_path)
-
-    # Load weights; strict=False because rope_sin/rope_cos/self_attn_mask are
-    # computed buffers registered in __init__, not present in the HF checkpoint.
-    missing, unexpected = action_head.denoising_wrapper.load_state_dict(expert_sd, strict=False)
+    missing, unexpected = wrapper.load_state_dict(expert_sd, strict=False)
     non_buf = [k for k in missing if not any(s in k for s in ('rope_sin','rope_cos','self_attn_mask'))]
-    assert not non_buf, f"Unexpected missing non-buffer keys: {non_buf}"
+    assert not non_buf, f"Missing non-buffer keys: {non_buf}"
     assert not unexpected, f"Unexpected extra keys: {unexpected}"
+    print(f"  Loaded {len(expert_sd)} expert weights ✓")
+
+    # Attach pre-weighted wrapper to action head and compile
+    action_head.denoising_wrapper = wrapper
+    action_head.attention_mask = action_head._build_attention_mask()
+    wrapper.compile(save_path)
 
     elapsed = time.time() - t0
     _verify(save_path, 'action_expert')

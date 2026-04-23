@@ -288,7 +288,7 @@ class NeuronDenoisingWrapper(ModelWrapper):
     """
 
     def __init__(self, config: NeuronDenoisingConfig):
-        super().__init__(config=config, model_cls=None)
+        super().__init__(config=config, model_cls=type(self))
         self.config = config
 
     @abc.abstractmethod
