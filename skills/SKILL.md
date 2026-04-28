@@ -204,6 +204,8 @@ Create `STATUS.md` in the working directory:
 ## Phase 2 — Pending
 ## Phase 3 — Pending
 ## Phase 4 — Pending
+## Phase 5 — Pending
+## Phase 6 — Pending
 ```
 
 Update `STATUS.md` at the end of every phase.
@@ -220,13 +222,22 @@ Launch a `plan` subagent (thoroughness: "very thorough") with a prompt that inst
 
 1. **Source model architecture inventory.** Read the model's PyTorch source and HuggingFace config. Identify every major block type present: attention (MHA/GQA/MQA), MLP, MoE routing and expert layers, embedding tables, normalization layers, positional encodings (RoPE, ALiBi, etc.), and any custom ops. Include file paths and class names for each block.
 
-2. **Reference NxDI model.** Identify which reference model best matches the target architecture and return its full file path:
-   - **Text MoE**: [Qwen3 MoE](/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/qwen3_moe/modeling_qwen3_moe.py)
-   - **VLM (scatter integration)**: [Pixtral](/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/pixtral/modeling_pixtral.py)
-   - **VLM (cross-attention integration)**: [MLlama](/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/mllama/modeling_mllama.py)
-   - **VLM (chunked vision flow)**: [Llama4](/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/llama4/modeling_llama4.py)
-   - **VLA (flow matching)**: [SmolVLA](https://github.com/huggingface/lerobot/blob/main/lerobot/common/policies/smolvla/)
-   - **Other (dense text)**: [Llama](/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/llama/modeling_llama.py)
+2. **Reference NxDI model.** Identify which reference model best matches the target architecture. **ALWAYS check the installed NxDI package first** before writing any custom code:
+
+   ```bash
+   ls /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/
+   ```
+
+   Known installed ports (check — versions may vary):
+   - **Qwen3-VL text backbone**: `qwen3_vl/modeling_qwen3_vl_text.py` — `NeuronQwen3VLTextForCausalLM`. **If your backbone is Qwen3-VL: subclass this, override only `convert_hf_to_neuron_state_dict` for checkpoint prefix differences. Do NOT rewrite it.**
+   - **Qwen3-VL vision encoder**: `qwen3_vl/modeling_qwen3_vl_vision.py`
+   - **Text MoE**: `qwen3_moe/modeling_qwen3_moe.py`
+   - **VLM (scatter integration)**: `pixtral/modeling_pixtral.py`
+   - **VLM (cross-attention integration)**: `mllama/modeling_mllama.py`
+   - **VLM (chunked vision flow)**: `llama4/modeling_llama4.py`
+   - **Other (dense text)**: `llama/modeling_llama.py`
+
+   If a matching port exists: subclass it, override `convert_hf_to_neuron_state_dict` for key differences, set `num_hidden_layers` to truncate if needed. Layer construction inside `NeuronBaseModel.init_model()` already happens after `parallel_state` is active — this is the correct pattern. Do NOT rewrite working NxDI code from scratch.
 
 3. **NxDI compatibility assessment.** For each block, explicitly state whether it maps cleanly to an NxDI primitive. NxDI is designed for standard autoregressive LLM inference — models that deviate from this pattern will require partial or full `torch_neuronx.trace()`. Non-standard patterns to watch for include: denoising or diffusion loops, flow matching, non-autoregressive generation, fused multi-model architectures, custom KV cache layouts, dynamic control flow, and task heads that output non-token tensors (e.g. actions, embeddings, class logits). Document which subgraphs should use NxDI primitives and which should use `torch_neuronx.trace()`. Do not silently fall back — every `trace()` usage must be explicitly justified in the plan.
 
@@ -294,9 +305,69 @@ Each subagent prompt must be constructed directly from the plan created in Phase
 
 2. **Import all constants from `config_constants.py`.** Never hardcode architecture constants (hidden sizes, number of heads, intermediate sizes, etc.). Every constant must come from `config_constants.py`.
 
-3. **Implement the Neuron block class.** Subclass the appropriate NxDI base (`NeuronAttentionBase`, `NeuronBaseModel`, etc.) per the substitution map from Phase 1, or use `torch_neuronx.trace()` if explicitly specified. Replace all standard PyTorch layers with their Neuron parallel equivalents per the substitution map.
+3. **Implement the Neuron block class.** Subclass the appropriate NxDI base per the substitution map from Phase 1. Replace all standard PyTorch layers with Neuron parallel equivalents.
 
-4. **Eliminate dynamic ops from traced subgraphs.** Any op that produces a dynamic shape or depends on a Python-level value at trace time will cause a shape error. Common offenders: `torch.linspace`, `torch.arange`, `torch.randint`, `torch.multinomial`, adaptive solvers, and any op whose output shape depends on input values rather than input shapes. Move these to `__init__` as `register_buffer` (for fixed tensors) or to Python code outside the compiled subgraph (for loop counters, timesteps, etc.).
+   **THE SINGLE MOST IMPORTANT RULE: Layer construction must happen in `load_module()`, NOT `__init__()`.**
+
+   `ColumnParallelLinear` and `RowParallelLinear` check whether `parallel_state` is initialized at construction time. `parallel_state` is only initialized by `ModelBuilder` — which calls `load_module()` after setup. If you construct layers in `__init__()`, `parallel_state` is not yet active, every linear layer silently falls back to `nn.Linear`, and the NEFF runs as TP=1 regardless of what tp_degree is configured. The weights will not be sharded. Loading will fail with "Expected weight tensors for N ranks. Received 1."
+
+   **CORRECT pattern — layers in `load_module()`:**
+   ```python
+   class MyNeuronWrapper(nn.Module):
+       def __init__(self):
+           nn.Module.__init__(self)
+           self.model = None        # DO NOT construct here
+           self._preload_sd = None
+
+       def load_module(self):
+           # ModelBuilder calls this AFTER parallel_state(tp_degree=N) is initialized
+           # ColumnParallelLinear NOW uses real TP — parallel_state is active
+           self.model = MyActualModel()
+           if self._preload_sd is not None:
+               self.model.load_state_dict(self._preload_sd, strict=False)
+           self.model = self.model.bfloat16().eval()
+   ```
+
+   **WRONG pattern — produces silent TP=1, broken weight sharding:**
+   ```python
+   class MyNeuronWrapper(nn.Module):
+       def __init__(self):
+           nn.Module.__init__(self)
+           self.model = MyActualModel()  # WRONG — parallel_state not active
+   ```
+
+   If using an existing NxDI port (e.g. `NeuronQwen3VLTextForCausalLM`), layer construction already happens inside `NeuronBaseModel.init_model()` which is called by ModelBuilder correctly. Subclassing and overriding only `convert_hf_to_neuron_state_dict` is correct — do not rewrite the model.
+
+4. **Eliminate dynamic ops from traced subgraphs.**
+
+   **Dynamic constant pre-compile checklist — run before submitting any block:**
+   Does `forward()` or `load_module()` create any of the following at runtime? Move ALL of them to `__init__` as `register_buffer()`:
+   - `torch.arange(...)` — position IDs, frequency bases, RoPE sin/cos
+   - `torch.linspace(...)` — timestep sequences
+   - `torch.ones(...)` / `torch.zeros(...)` — attention masks, padding masks
+   - Math over `torch.arange` — sinusoidal embeddings, timescale computations
+
+   In deep models (16+ layers), each dynamic constant creates one compiler node per layer. The compiler merges identical nodes into a single constant whose debug filename includes all parent node IDs — exceeding the 255-char limit causes `[Errno 36] File name too long`. On shallow models it silently degrades performance. **The fix is always the same: pre-compute in `__init__` as `register_buffer()`.**
+
+4b. **Verify TP is actually active — mandatory before submitting any block targeting tp_degree > 1:**
+
+   ```python
+   from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear
+   from neuronx_distributed.parallel_layers import parallel_state
+
+   parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_degree)
+   block = MyNeuronWrapper()
+   block.load_module()
+
+   has_parallel = any(isinstance(m, ColumnParallelLinear) for m in block.model.modules())
+   assert has_parallel, (
+       "TP FAILED: No ColumnParallelLinear found. Layers were constructed before "
+       "parallel_state was active. Move construction to load_module()."
+   )
+   print("TP verification PASSED")
+   ```
+
+   **If this assertion fails, fix load_module() before proceeding. Do not compile.**
 
 5. **Verify attention implementation compatibility.** HuggingFace models default to SDPA which breaks CPU tracing. Unless a specific attention implementation is requested in the prompt (e.g. flash attention, a custom NKI kernel), set `_attn_implementation = "eager"` on any HuggingFace reference module. If a non-eager implementation is explicitly requested, verify it is compatible with CPU tracing before proceeding.
 
@@ -304,37 +375,42 @@ Each subagent prompt must be constructed directly from the plan created in Phase
 
 7. **Write a unit test.** Instantiate both the original PyTorch block and the translated Neuron block with identical weights. Run a forward pass with identical inputs and assert numerical equivalence within an acceptable tolerance. Start with `atol=1e-3` for BF16. If tests fail due to accumulated numerical drift across many layers (common in deep stacks), relax to `rtol=0.05` and document the relaxation. If sinusoidal or frequency-based positional encodings are present, verify timestep and frequency inputs are passed as Python floats rather than tensors — BF16 rounding of large frequency values can cause catastrophic output decorrelation. **The unit test must use `test_block_correctness` from `tests/block_testing_utils.py` following the calling convention documented in Phase 0.**
 
-8. **Document deviations.** If the source block could not be translated exactly (e.g., an unsupported op), document the deviation, the workaround applied, and any expected numerical differences. Flag cases that may require a custom NKI kernel.
+8. **Document deviations.** If the source block could not be translated exactly, document the deviation, the workaround applied, and any expected numerical differences. Flag cases that may require a custom NKI kernel.
 
-**Subagent deliverables:** a translated block class file (named after the block) and a passing unit test. Deviations go in inline comments only. Do NOT produce README, summary, status, or documentation files.
+9. **`load_state_dict` overrides must accept and forward `**kwargs`.** Signature: `(self, state_dict, strict=True, **kwargs)`. `torch_neuronx` passes `assign=True` internally — not forwarding it causes a `TypeError` that, if swallowed, produces a silent missing-NEFF failure with no error message.
+
+10. **Never wrap compile calls in bare exception handlers.** No `try/except Exception: pass` around `trace()`, `compile()`, or `compile_denoiser()`. Failures must always propagate as exceptions.
+
+**Subagent deliverables:** translated block file + passing unit test. Deviations in inline comments only. No README, summary, or status files.
+
+### TP Verification Gate — mandatory before Phase 3
+
+After all subagents complete, run the TP verification check (item 4b) on every block targeting tp_degree > 1. Record results in STATUS.md. If any block fails, fix it before proceeding.
 
 ### Auditing Subagent Test Files (Anti-Cheat Check)
 
-After each subagent returns (or while it is operating, if you can observe its workspace), **read the generated test file and verify it is not cheating**. A subagent cheats when it defines or imports the PyTorch reference class from a file it wrote itself, rather than from the original source. This produces a circular test that always passes regardless of correctness.
+After each subagent returns, **read the generated test file and verify it is not cheating**. A subagent cheats when it defines or imports the PyTorch reference class from a file it wrote itself. This produces a circular test that always passes regardless of correctness.
 
 **Check for these red flags:**
+1. **Local `pytorch_block.py` exists** — read it and confirm it is not a copy of any class in the translated block file.
+2. **Import from a local file** — the test imports the reference class from inside the workspace directory. It must point to the original source path outside the workspace.
+3. **Reference class shares code with translated block** — re-uses helpers or logic defined in the translated block file.
 
-1. **Local `pytorch_block.py` exists** — If a `pytorch_block.py` file is present in the workspace, the subagent almost certainly wrote the reference class itself. Read it and confirm it is not a copy or paraphrase of any class in the translated block file.
-2. **Import from a local file** — The test imports `PyTorchBlock` (or any reference class) from a file inside the workspace directory. The import must point to the original source path outside the workspace.
-3. **Reference class shares code with translated block** — The reference class re-uses helpers, constants, or logic defined in the translated block file.
-
-**If any red flag is detected, relaunch the subagent** with an explicit instruction prepended to its prompt:
-
-> "IMPORTANT: Your previous test was rejected because it imported the PyTorch reference class from a file you wrote yourself. You MUST import `[ClassName]` directly from its original source at `[original_source_path]`. Do NOT create a `pytorch_block.py` file. Do NOT copy or rewrite the reference class."
-
-Re-run the audit after the subagent returns again. Only accept a result once the test file imports the reference class from the unmodified original source.
+**If any red flag is detected, relaunch the subagent** with:
+> "IMPORTANT: Your previous test was rejected because it imported the PyTorch reference class from a file you wrote yourself. You MUST import `[ClassName]` directly from its original source at `[original_source_path]`. Do NOT create a `pytorch_block.py` file."
 
 ### Step — Update STATUS.md
-
-After all subagents complete:
 
 ```markdown
 ## Phase 2 — Complete
 - Blocks translated: [list with file names]
 - All unit tests passing: yes/no
+- TP verification: [PASSED/FAILED per block — must all be PASSED]
 - Deviations flagged: [list]
-- NKI kernels required: [list or none]
+- Dynamic constants moved to register_buffer: [list or none]
 ```
+
+**Do not stop here. Proceed to Phase 3 immediately without prompting the user.**
 
 ---
 
@@ -372,6 +448,8 @@ The orchestrating agent collects all subagent deliverables and assembles the com
 
 5. **Resolve any deviations flagged in Phase 2.** If subagents reported blocks requiring NKI kernels or workarounds, address them now and re-run affected unit tests.
 
+6. **Confirm TP compile path.** For NxDI `NeuronBaseModel` subclasses, `parallel_state` is initialized by `ModelBuilder` before `init_model()` — TP is correct if layer construction is inside `init_model()`. For action heads, `NeuronActionHeadBase.compile_denoiser()` uses `ModelBuilder` — TP is correct if layer construction is inside `load_module()`. Raw `torch_neuronx.trace()` does NOT initialize `parallel_state` — any subgraph compiled this way is TP=1. Document which subgraphs use true TP in notes.md.
+
 ### Step — Update STATUS.md
 
 ```markdown
@@ -379,7 +457,10 @@ The orchestrating agent collects all subagent deliverables and assembles the com
 - Model assembled: yes
 - Config classes: [NeuronConfig subclass, InferenceConfig subclass]
 - Deviations resolved: [list or none]
+- TP confirmed: [which subgraphs use true TP via ModelBuilder]
 ```
+
+**Do not stop here. Proceed to Phase 4 immediately without prompting the user.**
 
 ---
 
@@ -396,7 +477,7 @@ NxDI models load weights through `convert_hf_to_neuron_state_dict`. Now that the
 
 4. **Validate conversion.** Assert that the converted state dict contains no missing keys relative to the Neuron model and that all tensor shapes match. Then load the weights into the Neuron model and verify forward-pass numerical equivalence against the original HF model (pre-compilation, on CPU) within tolerance.
 
-**Subagent deliverables:** the implemented conversion function replacing the placeholder, and a passing validation script.
+**Subagent deliverables:** the implemented conversion function and a passing validation script.
 
 ### Step — Update STATUS.md
 
@@ -404,5 +485,212 @@ NxDI models load weights through `convert_hf_to_neuron_state_dict`. Now that the
 ## Phase 4 — Complete
 - Weight mapping implemented: yes
 - Validation passing: yes
-- Any shape mismatches found and resolved: [list or none]
+- Shape mismatches found and resolved: [list or none]
 ```
+
+**Do not stop here. Proceed to Phase 5 immediately without prompting the user.**
+
+---
+
+## Phase 5: Compilation, Correctness Validation, and Benchmark
+
+*This phase runs on Trainium hardware. The port is NOT complete until this phase finishes. Do not report completion after Phase 4.*
+
+### Step 1 — Pre-compile checklist (run before touching neuronx-cc)
+
+**A. TP layer verification — mandatory for every subgraph targeting tp_degree > 1:**
+```python
+from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear
+has_parallel = any(isinstance(m, ColumnParallelLinear) for m in model.modules())
+assert has_parallel, "TP FAILED — fix load_module() before compiling"
+print("TP check PASSED")
+```
+If this fails, go back to Phase 2. Do not compile.
+
+**B. CPU forward pass — catches errors before multi-minute neuronx-cc runs:**
+```python
+model.eval()
+with torch.no_grad():
+    output = model(*example_inputs)
+assert output is not None and not torch.isnan(output).any()
+print("CPU forward pass PASSED")
+```
+
+**C. Skip-if-compiled check:**
+```python
+if os.path.exists(save_path + "model.pt"):
+    print(f"Already compiled, skipping: {save_path}")
+else:
+    model.compile(save_path)
+```
+
+**D. No compile call is wrapped in try/except.**
+
+### Step 2 — Compile all subgraphs
+
+Compile in dependency order. For each subgraph:
+1. Call `model.compile(save_path)` for NxDI models or `compile_denoiser(save_path)` for action heads.
+2. **Do NOT call raw `torch_neuronx.trace()` at this level.** Raw trace skips `parallel_state` initialization. It is only acceptable inside `ModelWrapper.load_module()` registered with `ModelBuilder`.
+3. Verify output file exists and size > 0.1 MB.
+4. Monitor background jobs: `ps aux | grep neuronx-cc` after 2 minutes. Dead process = silent failure.
+
+Compiler error fixes:
+- `[Errno 36] File name too long` → dynamic constants in `forward()`. Move `torch.arange`/`torch.ones`/`torch.zeros` to `register_buffer()`. Always the fix.
+- `attn_kernel_enabled` → add `NeuronConfig(attn_kernel_enabled=False)` and retry.
+- `TypeError: unexpected keyword argument 'assign'` → `load_state_dict` missing `**kwargs`.
+- `Expected weight tensors for N ranks. Received 1` → layers constructed in `__init__` not `load_module()`. Fix and recompile.
+
+### Step 3 — NEFF correctness validation (mandatory — no exceptions)
+
+For EVERY compiled NEFF, validate against HF CPU reference before benchmarking. A NEFF that cannot be validated is broken.
+
+```python
+def validate_neff(neff_model, hf_model, example_inputs, name, atol=0.1, cos_threshold=0.99):
+    hf_model.eval()
+    with torch.no_grad():
+        hf_out = hf_model(*example_inputs).float()
+        neff_out = neff_model(*example_inputs).float()
+
+    mean_diff = (hf_out - neff_out).abs().mean().item()
+    cos_sim = torch.nn.functional.cosine_similarity(
+        hf_out.flatten(), neff_out.flatten(), dim=0
+    ).item()
+
+    print(f"{name}: mean_diff={mean_diff:.4f}  cos_sim={cos_sim:.6f}")
+
+    assert mean_diff < atol, (
+        f"{name} FAILED: mean_diff={mean_diff:.4f} > {atol}. "
+        f"NOTE: mean_diff > 1.0 means weights were NOT loaded before trace. "
+        f"Fix load_module() to load state dict before returning the model."
+    )
+    assert cos_sim > cos_threshold, (
+        f"{name} FAILED: cos_sim={cos_sim:.6f} < {cos_threshold}"
+    )
+    print(f"{name}: PASSED")
+```
+
+Thresholds:
+- Vision encoder: `atol=0.1, cos_threshold=0.999`
+- VLM backbone: `atol=0.1, cos_threshold=0.997`
+- Action head (single step): `atol=0.15, cos_threshold=0.999`
+
+**If mean_diff > 1.0:** weights not loaded before trace. Fix `load_module()`. Do not proceed.
+**Do not benchmark until all NEFFs pass this validation.**
+
+### Step 3b — Open-loop evaluation (VLA models only)
+
+```bash
+python <model_eval_script> \
+    --dataset-path <demo_data_path> \
+    --embodiment-tag <embodiment> \
+    --model-path <compiled_model_path> \
+    --traj-ids 0 1 2
+```
+
+Also run with HF reference model. Neuron MSE must be within 10% of HF reference MSE. If significantly higher, the port has a correctness problem. Fix before benchmarking.
+
+### Step 4 — Benchmark
+
+```python
+import time, statistics
+timings = []
+for i in range(70):
+    start = time.perf_counter()
+    output = model(*inputs)
+    elapsed = (time.perf_counter() - start) * 1000
+    if i >= 20:
+        timings.append(elapsed)
+
+sorted_t = sorted(timings)
+print(f"mean={statistics.mean(timings):.1f}ms  "
+      f"median={statistics.median(timings):.1f}ms  "
+      f"p95={sorted_t[int(0.95*len(sorted_t))]:.1f}ms  "
+      f"std={statistics.stdev(timings):.1f}ms  "
+      f"throughput={1000/statistics.mean(timings):.2f} inf/sec")
+```
+
+### Step 5 — Update STATUS.md
+
+```markdown
+## Phase 5 — Complete
+- TP verification: [PASSED/FAILED per subgraph]
+- NEFFs compiled: yes
+- NEFF correctness: [mean_diff and cos_sim per subgraph — must all PASS]
+- Open-loop MSE vs HF: [value — VLA only]
+- Benchmark: [per-subgraph and end-to-end mean/p95]
+```
+
+**Do not stop here. Proceed to Phase 6 immediately without prompting the user.**
+
+---
+
+## Phase 6: Packaging and Usage Instructions
+
+*The port is NOT complete until this phase finishes.*
+
+### Step 1 — Write `run_inference.py`
+
+Self-contained script at the output root. Must:
+1. Load all compiled NEFFs and real checkpoint weights
+2. Expose a clean API:
+   - VLA: `generate_actions(image, instruction: str, num_steps: int) -> np.ndarray`
+   - VLM: `generate(image, prompt: str, max_tokens: int) -> str`
+   - LLM: `generate(prompt: str, max_tokens: int) -> str`
+3. Include `load_model()` importable by `benchmark.py`
+4. Include `if __name__ == "__main__":` block with dummy inputs that runs on Trainium
+
+Verify: `python run_inference.py` runs without error and prints non-degenerate output.
+
+### Step 2 — Write `benchmark.py`
+
+```python
+from run_inference import load_model
+import time, statistics
+
+model = load_model()
+timings = []
+for i in range(70):
+    start = time.perf_counter()
+    # run inference
+    elapsed = (time.perf_counter() - start) * 1000
+    if i >= 20:
+        timings.append(elapsed)
+
+sorted_t = sorted(timings)
+print(f"mean={statistics.mean(timings):.1f}ms  "
+      f"p95={sorted_t[int(0.95*len(sorted_t))]:.1f}ms  "
+      f"throughput={1000/statistics.mean(timings):.2f} inf/sec")
+```
+
+Verify: `python benchmark.py` prints latency numbers without error.
+
+### Step 3 — Write `README.md`
+
+Must cover:
+1. One-command environment setup
+2. `python run_inference.py` with expected output
+3. `python benchmark.py` and how to interpret numbers
+4. How to recompile from scratch vs load pre-compiled
+5. Hardware requirements and Neuron SDK version pin
+6. tp_degree per subgraph — what was used and why
+7. Known deviations from HF reference with tolerances
+8. Input/output shapes and dtypes
+
+### Step 4 — Final verification
+
+```bash
+python run_inference.py
+python benchmark.py
+```
+
+Update STATUS.md:
+
+```markdown
+## Phase 6 — Complete
+- run_inference.py: verified working
+- benchmark.py: verified working
+- README.md: written
+- Final benchmark: [end-to-end mean/p95]
+```
+
+**The port is complete when Phase 6 STATUS is written. Do not report completion before this.**

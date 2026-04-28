@@ -76,14 +76,52 @@ before writing any other code.
 
 Both `NeuronDenoisingWrapper` and `NeuronActionHeadBase` are defined in
 `scripts/neuron_action_head_base.py` in the skill directory. Import them from
-there — do not redefine them. Your job is to subclass them, not rewrite them:
+there — do not redefine them:
 
 ```python
 from scripts.neuron_action_head_base import (
     NeuronDenoisingWrapper,
     NeuronActionHeadBase,
+    NeuronDenoisingConfig,
     ConditioningContract,
 )
+from scripts.cross_attention_nki import cross_attention_kernel, get_tile_size
+```
+
+**MANDATORY: DiT model construction must happen in `load_module()`, NOT `__init__()`.**
+
+`NeuronDenoisingWrapper` subclasses `ModelWrapper`. `ModelBuilder` calls `load_module()`
+after initializing `parallel_state`. If you construct the DiT model in `__init__()`,
+`parallel_state` is not active, `ColumnParallelLinear` silently falls back to `nn.Linear`,
+the NEFF is TP=1, weight sharding fails, and NEFF loading fails with
+"Expected weight tensors for N ranks. Received 1."
+
+```python
+# CORRECT
+class NeuronGrootDenoisingWrapper(NeuronDenoisingWrapper):
+    def __init__(self, config):
+        nn.Module.__init__(self)   # bypass ModelWrapper.__init__ — it's LLM-oriented
+        self.config = config
+        self.model = None          # DO NOT construct DiT here
+        self._preload_sd = None
+
+    def load_module(self):
+        # parallel_state is active here — ColumnParallelLinear uses real TP
+        self.model = GR00TDiTModel(self.config)
+        if self._preload_sd is not None:
+            self.model.load_state_dict(self._preload_sd, strict=False)
+        self.model = self.model.bfloat16().eval()
+
+    def forward(self, noisy_actions, conditioning_tokens,
+                timestep_embedding, attention_mask):
+        return self.model(noisy_actions, conditioning_tokens,
+                          timestep_embedding, attention_mask)
+
+# WRONG — produces silent TP=1 and broken weight sharding
+class NeuronGrootDenoisingWrapper(NeuronDenoisingWrapper):
+    def __init__(self, config):
+        nn.Module.__init__(self)
+        self.model = GR00TDiTModel(config)  # WRONG — parallel_state not active
 ```
 
 ### 2.1 Compiled Graph Boundary
@@ -267,9 +305,27 @@ Key rules:
 ## Part 5: Gotchas
 
 **Dynamic iteration count** — `num_steps` must never enter the compiled graph as
-a tensor. If the original model passes it as a tensor argument to the denoiser
-forward, intercept it at the `generate_actions()` boundary and convert to a
-Python int before the loop.
+a tensor. Intercept at `generate_actions()` and convert to Python int before the loop.
+
+**Dynamic constants in denoising forward** — `torch.arange` for position IDs,
+`torch.ones` for attention masks, RoPE frequency computation — pre-compute ALL of
+these in `__init__` as `register_buffer()`. With 32 DiT layers this causes
+`[Errno 36] File name too long` at compile time. Fix: move every dynamic constant
+out of `forward()` into `__init__` as `register_buffer()`.
+
+**TP=1 from wrong construction order** — if the DiT model is constructed in
+`__init__()` instead of `load_module()`, the NEFF is silently TP=1, weight
+sharding produces 8 identical copies instead of 8 shards, and NEFF loading
+fails with "Expected weight tensors for N ranks. Received 1." See the correct
+load_module pattern in Part 2.
+
+**`load_state_dict` must accept `**kwargs`** — override signature:
+`(self, state_dict, strict=True, **kwargs)`. `torch_neuronx` passes `assign=True`
+internally. Not forwarding causes a TypeError that, if swallowed, produces a
+silent missing-NEFF failure.
+
+**Never wrap `compile_denoiser()` in a bare exception handler** — failures
+must propagate. A swallowed exception produces a missing NEFF with no error.
 
 **Noise schedule on CPU vs device** — the full schedule array (all timesteps,
 all sigma values) must be computed and stored on CPU before the loop. Only the
