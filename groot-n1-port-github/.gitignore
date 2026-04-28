@@ -1,0 +1,16 @@
+# Compiled NEFFs and weight shards (too large for git — store separately)
+compiled/
+weights/
+*.safetensors
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+log-neuron-cc.txt
+
+# HuggingFace cache
+.cache/
