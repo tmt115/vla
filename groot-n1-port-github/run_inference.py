@@ -316,20 +316,33 @@ class GR00TModel:
         state: torch.Tensor,          # [B, 1, MAX_STATE_DIM]
         embodiment_id: torch.Tensor,  # [B] long
         num_steps: int = NUM_INFERENCE_TIMESTEPS,
+        profile: bool = False,
     ) -> torch.Tensor:
         """
         Run inference. ViT must be run on CPU before calling this (via run_vit_cpu).
         Returns [B, ACTION_HORIZON, action_dim] BF16 action chunk.
+
+        Args:
+            profile: if True, print per-subgraph timing to stdout.
         """
+        import time as _time
+
+        def _t():
+            return _time.perf_counter() * 1000.0  # ms
+
         B = inputs_embeds.shape[0]
 
         # Step 1: Backbone LLM (pre_cos/pre_sin injected via cos_cache/sin_cache kwargs)
+        t0 = _t()
         backbone_out = self.backbone_wrapper(inputs_embeds, pre_cos, pre_sin)
+        t_backbone = _t() - t0
         # [B, SEQ, 2048]
 
         # Step 2: VLLN + VL self-attention
+        t0 = _t()
         backbone_out = self.vlln(backbone_out)
         conditioning_tokens = self.vl_self_attn_wrapper(backbone_out)
+        t_vl_sa = _t() - t0
         # [B, SEQ, 2048]
 
         # Step 3: State encoding
@@ -344,6 +357,7 @@ class GR00TModel:
             B, 1, DIT_INPUT_SEQ_LEN, NUM_CONDITIONING_TOKENS, dtype=torch.int32
         )
 
+        dit_times = []
         for step in range(num_steps):
             t = 1.0 - step / num_steps
             t_bucket = torch.tensor(
@@ -365,7 +379,9 @@ class GR00TModel:
             temb = self.timestep_encoder(t_bucket)  # [B, 1536]
 
             # DiT forward (compiled NEFF)
+            t0 = _t()
             velocity_pred = self.dit_wrapper(sa_embs, conditioning_tokens, temb, cross_mask)
+            dit_times.append(_t() - t0)
             # [B, 41, 1024] → action portion [B, 40, 1024]
             action_velocity = velocity_pred[:, -ACTION_HORIZON:, :]
 
@@ -373,6 +389,13 @@ class GR00TModel:
             dt = 1.0 / num_steps
             v_decoded = self.action_decoder(action_velocity, embodiment_id)
             noisy_actions = noisy_actions - dt * v_decoded
+
+        if profile:
+            print(f"  [profile] backbone NEFF:    {t_backbone:.2f}ms")
+            print(f"  [profile] VL self-attn NEFF:{t_vl_sa:.2f}ms")
+            for i, t in enumerate(dit_times):
+                print(f"  [profile] DiT step {i+1}/{num_steps}:   {t:.2f}ms")
+            print(f"  [profile] DiT total:        {sum(dit_times):.2f}ms")
 
         return noisy_actions  # [B, ACTION_HORIZON, MAX_ACTION_DIM]
 

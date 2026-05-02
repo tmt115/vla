@@ -427,13 +427,7 @@ class NeuronGR00TActionHead(NeuronActionHeadBase):
         return self._preload_sd if self._preload_sd else {}
 
     def get_compiler_args(self) -> str:
-        return (
-            "--auto-cast=none "
-            "--model-type=transformer "
-            "--tensorizer-options='"
-            "--enable-ccop-compute-overlap "
-            "--cc-pipeline-tiling-factor=1'"
-        )
+        return "-O1"
 
 
 # ---------------------------------------------------------------------------

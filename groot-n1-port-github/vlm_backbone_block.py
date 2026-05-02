@@ -97,6 +97,11 @@ def _make_backbone_inference_config(tp_degree: int = TP_DEGREE_VLM) -> Inference
             seq_len=NUM_CONDITIONING_TOKENS,
             torch_dtype=torch.bfloat16,
             on_cpu=(tp_degree == 1),
+            # Disable NKI flash-attention kernel → use native XLA matmul+softmax path.
+            # Flash attention is numerically approximate (tiled online softmax), producing
+            # ~3% per-layer deviation from HF eager attention that compounds to cos_sim=0.55
+            # over 16 layers. Native matmul is exact up to XLA bfloat16 rounding.
+            attn_kernel_enabled=False,
         ),
         hidden_size=LLM_HIDDEN_SIZE,
         num_hidden_layers=LLM_NUM_LAYERS,
@@ -278,13 +283,7 @@ class NeuronGR00TBackboneHead(NeuronActionHeadBase):
         return self._preload_sd if self._preload_sd else {}
 
     def get_compiler_args(self):
-        return (
-            "--auto-cast=none "
-            "--model-type=transformer "
-            "--tensorizer-options='"
-            "--enable-ccop-compute-overlap "
-            "--cc-pipeline-tiling-factor=1'"
-        )
+        return "-O1"
 
     def get_conditioning_contract(self):
         from neuron_action_head_base import ConditioningContract

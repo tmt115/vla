@@ -11,6 +11,10 @@ __pycache__/
 # Logs
 *.log
 log-neuron-cc.txt
+neuronxcc-*/
 
 # HuggingFace cache
 .cache/
+
+# Misc
+global_metric_store.json

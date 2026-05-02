@@ -233,16 +233,29 @@ full_hf = _get_full_qwen_model(hf_sd)
 pos_ids_ref, _ = full_hf.model.get_rope_index(inp['input_ids'], inp['image_grid_thw'], inp['attention_mask'])
 
 with torch.no_grad():
-    # attention_mask=ones → HF full (bidirectional) attention.
-    # NxDI NEFF (attention_mask=None → causal_mask=False) = full attention.
-    full_attn_mask = torch.ones(BATCH_SIZE, NUM_CONDITIONING_TOKENS, dtype=torch.long)
-    ref_lm_out = ref_bb.model.language_model(
-        inputs_embeds=inputs_embeds,
-        position_ids=pos_ids_ref,
-        attention_mask=full_attn_mask,
-        use_cache=False,
-    )
-    ref_out_bb = ref_lm_out.last_hidden_state  # [B, SEQ, 2048], norm'd
+    # NxDI NEFF: full bidirectional attention, uses pre_cos/pre_sin from run_vit_cpu.
+    # HF reference: 4D all-zeros additive mask forces full attention.
+    # Force HF reference to use IDENTICAL cos/sin as the NEFF by monkey-patching
+    # rotary_emb. The two separate HF model instances (full and ref_bb) may produce
+    # slightly different cos/sin for the same position_ids due to @dynamic_rope_update
+    # state differences; pinning them to the same pre_cos/pre_sin ensures fair comparison.
+    full_4d = torch.zeros(BATCH_SIZE, 1, NUM_CONDITIONING_TOKENS, NUM_CONDITIONING_TOKENS,
+                          dtype=torch.bfloat16)
+    # Patch rotary_emb.forward so the reference uses identical cos/sin as the NEFF.
+    # Can't assign a lambda directly (PyTorch requires nn.Module for registered modules),
+    # so patch the bound method instead.
+    _orig_rope_fwd = ref_bb.model.language_model.rotary_emb.forward
+    ref_bb.model.language_model.rotary_emb.forward = lambda x, pos_ids: (pre_cos, pre_sin)
+    try:
+        ref_lm_out = ref_bb.model.language_model(
+            inputs_embeds=inputs_embeds,
+            position_ids=pos_ids_ref,
+            attention_mask=full_4d,
+            use_cache=False,
+        )
+        ref_out_bb = ref_lm_out.last_hidden_state  # [B, SEQ, 2048], norm'd
+    finally:
+        ref_bb.model.language_model.rotary_emb.forward = _orig_rope_fwd  # always restore
     # NEFF: new signature (inputs_embeds, pre_cos, pre_sin)
     neff_out_bb = wrapper_bb(inputs_embeds, pre_cos, pre_sin)
 

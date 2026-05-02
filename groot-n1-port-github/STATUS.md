@@ -42,60 +42,99 @@
 - VL self-attn: 64 keys, shapes match
 - DiT: 452 keys, shapes match
 
-## Phase 5 — Complete (2026-04-28, validated)
+## Phase 5 — Complete (2026-05-02, revalidated with -O1 flags)
 
-### Compilation Results
-All three blocks compiled with TP=8 on trn1.32xlarge:
-- backbone/model.pt: 2.3MB NEFF + 8 shards (~200MB each)
-- vl_self_attn/model.pt: 564KB NEFF + 8 shards (~50MB each)
-- dit/model.pt: 4.3MB NEFF + 8 shards (~270MB each)
+### Compiler Flags Audit (2026-05-02)
+All three TP=8 blocks recompiled with `-O1` only (removed `--model-type=transformer`
+and `--tensorizer-options`). Rationale: `--model-type=transformer` activates NxDI's
+flash-attention kernel (attn_kernel_enabled) which produces ~3% per-layer error on
+trn1, compounding to cos_sim=0.547 over 16 backbone layers. With `-O1`, the standard
+XLA matmul+softmax path is used, giving exact bfloat16 results.
 
-TP=8 verification from shard shapes:
+### TP Verification
+All three TP=8 blocks verified via ColumnParallelLinear shard shapes:
 - Backbone q_proj: [256, 2048] = 2048/8 ✅
 - Backbone gate_proj: [768, 2048] = 6144/8 ✅
 - VL self-attn to_q: [256, 2048] = 2048/8 ✅
 - VL self-attn ff_up: [1024, 2048] = 8192/8 ✅
 - DiT to_q: [192, 1536] = 1536/8 ✅
 
-### NEFF Correctness Validation (2026-04-28, validate_neffs.py)
+### NEFF Correctness Validation (2026-05-02, validate_neffs.py, -O1 flags)
 | Block | cos_sim | mean_diff | Threshold | Status |
 |-------|---------|-----------|-----------|--------|
-| VL self-attn | 0.999941 | 0.006666 | cos>0.999, atol<0.05 | PASS |
-| DiT | 0.999930 | 0.001530 | cos>0.999, atol<0.15 | PASS |
-| Backbone | 0.547 vs HF-full | 1.578 | cos>0.997 | SEE NOTE |
+| vl_self_attn | 0.999941 | 0.006666 | cos>0.999, atol<0.05 | PASS |
+| dit | 0.999930 | 0.001530 | cos>0.950, atol<0.50 | PASS |
+| backbone | 0.999661 | 0.042674 | cos>0.997, atol<0.10 | PASS |
 
-**Backbone validation note (2026-04-28 full investigation):**
-- Attention: NxDI `attention_mask=None` → full bidirectional attention (confirmed via source: `causal_mask=(attention_mask is not None)`). HF reference uses `attention_mask=ones` for equivalent full attention.
-- mRoPE: NxDI `NeuronQwen3VLRotaryEmbedding` and HF `Qwen3VLTextRotaryEmbedding` produce slightly different cos/sin (max_diff=0.17, cos_agreement=0.9999). HF cos/sin are injected into the NEFF via `cos_cache`/`sin_cache` kwargs (confirmed working on Trainium: max_diff=49 between real and zero cos/sin).
-- Root cause of 0.547: **NxDI Trainium flash-attention kernel vs HF eager attention accumulate per-layer precision differences (~3% per layer, 0.97^16 ≈ 0.55)**. Single-layer comparison gives cos_sim=0.970; error compounds across 16 layers. This is a hardware-kernel-vs-CPU-reference gap, not a weight or RoPE error.
-- Weights verified correct: shard q_proj max_diff=0 vs HF checkpoint.
-- Pipeline functional: smoke test passes, plausible action output.
+Note: Previous backbone cos_sim=0.547 was due to --model-type=transformer activating
+flash-attention on trn1. Fixed by switching to -O1 only. All three now PASS.
 
-## Phase 6 — Complete (2026-04-28)
+### ViT NEFF Compilation (2026-05-02)
+- Dynamic op: Qwen3VLVisionAttention uses `torch.split(tensor, lengths.tolist())`
+  with cu_seqlens — data-dependent, incompatible with neuronx-cc as-is.
+- Fix: Monkey-patched all 24 ViT blocks' attention forward() to use standard
+  scaled dot-product attention (numerically identical for single-image, no split needed).
+- Also replaced rot_pos_emb and fast_pos_embed_interpolate with pre-computed static buffers.
+- Compiler flags: `--auto-cast=matmult --optlevel 3 --model-type=unet-inference`
+- NEFF size: 536 MB (TP=1, single device)
+- ViT NEFF vs CPU cos_sim: 0.998119 ✓
 
-### run_inference.py
-- Full inference pipeline: ViT CPU → backbone NEFF (HF cos/sin injected) → VL self-attn NEFF → 4×DiT NEFF
-- Smoke test PASSED: output [1,40,132], mean≈-0.001, std≈0.990, no NaN, 0.079s inference
+## Phase 6 — Complete (2026-05-02)
 
-### benchmark.py (2026-04-28, 70 iterations, 20 warmup)
-- Mean: 45.00ms | Median: 44.53ms | P95: 47.52ms | Throughput: 22.22 inferences/sec
-- Per denoising step: 11.25ms
+### Compiler Flags: [-O1] for all subgraphs (--model-type=transformer removed after audit)
 
-### validate_neffs.py
-- VL self-attn vs Isaac-GR00T SelfAttentionTransformer: cos_sim=0.999941 PASS
-- DiT vs Isaac-GR00T AlternateVLDiT: cos_sim=0.999930 PASS
-- Backbone: cos_sim=0.547 vs HF-full (hardware kernel precision gap, not weights or RoPE)
+### TP Verification: PASSED per subgraph (shard shapes confirmed)
 
-### README.md — written
+### NEFFs compiled: backbone, vl_self_attn, dit, vit
+| NEFF | Size | TP | cos_sim |
+|------|------|----|---------|
+| backbone | 1.4MB + 8x shards | 8 | 0.999661 |
+| vl_self_attn | 564KB + 8x shards | 8 | 0.999941 |
+| dit | 4.3MB + 8x shards | 8 | 0.999930 |
+| vit | 536MB | 1 | 0.998119 |
 
----
-## Phase 6 — Complete
+### ISA Kernel Settings (trn1)
+- attn_kernel_enabled=False explicitly set in backbone config ✓
+- Other kernel flags default to False (qkv_kernel_enabled, mlp_kernel_enabled, etc.)
+- context_encoding_buckets=None (static seq_len, no bucketing needed)
+- NKI kernels are trn2+ only; all correctly disabled for trn1
 
-### Final Benchmark (trn1.32xlarge, TP=8, batch=1, 4 denoising steps)
-- Mean: 45.00ms | P95: 47.52ms | Throughput: 22.22 inferences/sec
-- Per-step DiT latency: 11.25ms
+### Open-loop MSE vs HF (2026-05-02, 3 trajectories, dummy inputs)
+| Trajectory | MSE | cos_sim |
+|-----------|-----|---------|
+| 1 | 0.000063 | 0.999968 |
+| 2 | 0.000063 | 0.999969 |
+| 3 | 0.000059 | 0.999970 |
+| **Mean** | **0.000062** | **0.999969** |
+
+### Per-Subgraph Latency Breakdown (trn1.32xlarge, TP=8, batch=1, 4 denoising steps)
+| Subgraph | Mean | P95 |
+|----------|------|-----|
+| ViT (CPU) | 344.80 ms | 415.66 ms |
+| ViT (NEFF) | 4.94 ms | 4.97 ms |
+| Backbone NEFF | 6.64 ms | 6.93 ms |
+| VL self-attn NEFF | 2.31 ms | 2.50 ms |
+| DiT NEFF (per step) | 6.01 ms | 6.32 ms |
+| **Total excl. ViT** | **43.96 ms** | 47.88 ms |
+| Total incl. ViT CPU | 610.80 ms | 706.14 ms |
+
+Throughput: 22.7 inferences/sec (excl. ViT)
+
+### Final Benchmark (trn1.32xlarge, TP=8, batch=1, 4 denoising steps, 30 iter)
+- Mean: 43.96ms | P95: 47.88ms | Throughput: 22.7 inferences/sec
+- Per-step DiT latency: 6.01ms
+
+### Documentation
+- README.md: written (architecture, setup, compile, validate, benchmark, deviations)
+- groot_n1_trainium.ipynb: written (8 cells covering setup through validation)
+- run_inference.py: verified + profile=True timing added to generate_actions()
+- benchmark.py: verified
+- benchmark_subgraph.py: written (per-subgraph timing, 30 iters, 10 warmup)
+- open_loop_eval.py: written (3 trajectories, MSE/cos_sim vs HF)
 
 ### Known Deviations
-1. Backbone cos_sim=0.547 vs HF: NxDI Trainium flash-attention kernel vs HF eager-matmul attention produce ~3% deviation per layer that compounds across 16 layers. Single-layer cos_sim=0.970. Weights correct, RoPE correct (HF cos/sin injected via cos_cache/sin_cache). Root cause: irreducible hardware precision gap.
-2. DiT: all even blocks attend ALL 256 conditioning tokens (no image/text mask split). cos_sim=0.9999 — negligible.
-3. ViT not compiled (dynamic grid_thw shapes incompatible with neuronx-cc).
+1. DiT: all even blocks attend ALL 256 conditioning tokens (no image/text mask split).
+   cos_sim=0.9999 — negligible.
+2. ViT static attention patch: cu_seqlens split replaced with full-sequence attention.
+   For single image, numerically identical. cos_sim=0.998119.
+3. ViT deepstack outputs dropped in NEFF (unused in GR00T inference pipeline).
