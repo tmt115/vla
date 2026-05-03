@@ -241,6 +241,17 @@ Launch a `plan` subagent (thoroughness: "very thorough") with a prompt that inst
 
 3. **NxDI compatibility assessment.** For each block, explicitly state whether it maps cleanly to an NxDI primitive. NxDI is designed for standard autoregressive LLM inference — models that deviate from this pattern will require partial or full `torch_neuronx.trace()`. Non-standard patterns to watch for include: denoising or diffusion loops, flow matching, non-autoregressive generation, fused multi-model architectures, custom KV cache layouts, dynamic control flow, and task heads that output non-token tensors (e.g. actions, embeddings, class logits). Document which subgraphs should use NxDI primitives and which should use `torch_neuronx.trace()`. Do not silently fall back — every `trace()` usage must be explicitly justified in the plan.
 
+   **5M instruction limit.** If a single subgraph exceeds 5M compiler instructions (error `NCC_EVRF007`), split at block boundaries. Pattern: split at natural layer boundaries (e.g. after every N transformer blocks), pass intermediate tensors between parts, compile each part separately. Run `torch_neuronx.analyze()` before compilation to estimate instruction count.
+
+   **ISA kernel availability by hardware.** ISA kernel settings differ by platform — verify before setting `attn_kernel_enabled`:
+
+   | Platform | attn_kernel_enabled | qkv_kernel | mlp_kernel | Notes |
+   |----------|--------------------|-----------:|------------|-------|
+   | trn1 | False (explicit) | off | off | All ISA kernels off; enabling produces ~3% error per layer that compounds |
+   | trn2 tp=2 | True (required) | required | off | QKV+Attn kernels required — ICE NCC_ITEN404 without them |
+   | trn2 tp=4 | True (recommended) | recommended | off | MLP kernel hurts at small scale (-15.6%) |
+   | inf2 | False (explicit) | off | off | Different compiler bug; all kernels off |
+
 4. **Neuron substitution map.** For each block type found, map it to the corresponding NxDI primitive (`NeuronAttentionBase`, `RowParallelLinear`/`ColumnParallelLinear`, `ParallelEmbedding`, etc.) or mark as `trace()` with justification. Flag any blocks with no obvious NxDI equivalent.
 
 5. **HuggingFace config attribute inventory.** List all fields from the model's `PretrainedConfig` that must be surfaced in `InferenceConfig.get_required_attributes()`. For each attribute, note whether it exists verbatim in `config.json` or is computed/renamed at Python object construction time (the latter must be handled in `add_derived_config`). **Cross-reference every constant against `config_constants.py` — do not use values from `config.json` alone.**
@@ -370,6 +381,15 @@ Each subagent prompt must be constructed directly from the plan created in Phase
    **If this assertion fails, fix load_module() before proceeding. Do not compile.**
 
 5. **Verify attention implementation compatibility.** HuggingFace models default to SDPA which breaks CPU tracing. Unless a specific attention implementation is requested in the prompt (e.g. flash attention, a custom NKI kernel), set `_attn_implementation = "eager"` on any HuggingFace reference module. If a non-eager implementation is explicitly requested, verify it is compatible with CPU tracing before proceeding.
+
+   **Qwen3-VL vision encoder: packed attention removal.** The Qwen3-VL ViT uses `cu_seqlens`-based packed attention with `torch.split(..., lengths.tolist())` — data-dependent shapes incompatible with neuronx-cc. Before tracing, replace with standard full-sequence attention over the complete sequence. For single fixed-size images this is numerically identical. Add `_attn_implementation = "eager"` as well.
+
+   **Qwen3-VL `tie_word_embeddings` crash.** The 4B model has `tie_word_embeddings=true` in config, which causes a crash in SDK 2.28 during weight loading. Fix: copy `embed_tokens.weight` → `lm_head.weight` in `convert_hf_to_neuron_state_dict`:
+   ```python
+   if "lm_head.weight" not in state_dict and "embed_tokens.weight" in state_dict:
+       state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"].clone()
+   ```
+   This can also be applied as a pre-compilation monkey-patch on the model object.
 
 6. **Preserve the forward pass contract.** Ensure the translated block accepts and returns tensors matching the shapes and dtypes specified in the integration contract. Do not change semantics — only change the layer implementations.
 
@@ -534,11 +554,32 @@ Compile in dependency order. For each subgraph:
 3. Verify output file exists and size > 0.1 MB.
 4. Monitor background jobs: `ps aux | grep neuronx-cc` after 2 minutes. Dead process = silent failure.
 
+Compiler flag reference:
+
+| Flag | Effect | When to use |
+|------|--------|-------------|
+| `-O1` | Standard optimization, no model-type overrides | **Default for all subgraphs** (LLM, VLM, DiT, action heads) |
+| `--model-type=transformer` | Replaces softmax with custom NKI kernel | **Never use on DiT/denoising models.** Causes cos_sim=0.916, 37% error per step, blank output. Safe only for standard causal LM backbones that are not DiT. |
+| `--model-type=unet-inference` | Optimized for conv/ViT patterns | Vision encoders (SigLIP2, ViT). +6% over transformer for vision encoders. |
+| `--auto-cast=matmult` | BF16 matmuls, FP32 accumulators | Vision encoders. ~50% NEFF size reduction, 99.999% accuracy maintained. |
+| `--auto-cast=none` | No dtype casting | DiT and action head subgraphs — preserve BF16 throughout. |
+| `--optlevel 3` | Maximum optimization | Vision encoders with `--auto-cast=matmult`. |
+
 Compiler error fixes:
 - `[Errno 36] File name too long` → dynamic constants in `forward()`. Move `torch.arange`/`torch.ones`/`torch.zeros` to `register_buffer()`. Always the fix.
-- `attn_kernel_enabled` → add `NeuronConfig(attn_kernel_enabled=False)` and retry.
+- `attn_kernel_enabled` → add `NeuronConfig(attn_kernel_enabled=False)` and retry. **Check hardware first** — trn2 at tp=2 requires kernels on, trn1 requires kernels off. See Phase 1 ISA kernel matrix.
 - `TypeError: unexpected keyword argument 'assign'` → `load_state_dict` missing `**kwargs`.
 - `Expected weight tensors for N ranks. Received 1` → layers constructed in `__init__` not `load_module()`. Fix and recompile.
+- `NCC_IBIR039` → bucket size below minimum. Set minimum bucket to 512 (e.g. `buckets=[512, 1024, 2048]`).
+- `NCC_EVRF007` → subgraph exceeds 5M compiler instructions. Split at block boundaries. See Phase 1 note.
+
+**Vision encoder compilation pattern.** Vision encoders (SigLIP2, Qwen3-VL ViT) use raw `torch_neuronx.trace()` at TP=1, not NxDI ModelBuilder. See [reference/patterns/vit_compilation.md](reference/patterns/vit_compilation.md) for the full pattern. Expected: 70× speedup over CPU for SigLIP2-giant at batch=1.
+
+**HBM process lifetime.** The Neuron runtime holds NeuronCore allocations for the process lifetime — deleting a model in Python does NOT release HBM. Load subgraphs in the correct order. Use `NEURON_RT_VISIBLE_CORES` to pin components to specific cores (e.g. text encoder on core 0, transformer on cores 1-3). Use a subprocess for components that need a clean core allocation after a previous model has been loaded (e.g. text encoders before a large transformer). See [examples/flux1_lite_8b_trn2.ipynb] for a worked subprocess pattern.
+
+**VLM preprocessing: image resize to patch grid.** Client code must resize images to align with `patch_size × spatial_merge_size` before passing to the vision encoder. For Qwen3-VL this is 56 px (patch_size=14, spatial_merge=4). Arbitrary input sizes cause shape errors inside the compiled graph. Validate input dimensions in the preprocessing wrapper and raise a clear error before the NEFF call.
+
+**Deepstack intermediate features.** Some ViT configurations expose intermediate layer features (e.g. layers 5, 11, 17) in the forward output signature. Verify whether these are consumed at inference time before including them in the compiled graph. Unused outputs add NEFF size and latency for no benefit. Check the calling code — if `run_vit_cpu` or similar preprocessing is still mentioned, clarify exactly what enters the NEFF vs stays on CPU.
 
 ### Step 3 — NEFF correctness validation (mandatory — no exceptions)
 
@@ -577,7 +618,9 @@ Thresholds:
 **If mean_diff > 1.0:** weights not loaded before trace. Fix `load_module()`. Do not proceed.
 **Do not benchmark until all NEFFs pass this validation.**
 
-### Step 3b — Open-loop evaluation (VLA models only)
+### Step 3b — Open-loop evaluation (VLA models — MANDATORY hard gate)
+
+**This is not optional.** Phase 5 cannot be marked complete without open-loop evaluation results. NEFF correctness validation (Step 3) verifies single-step numerical agreement; open-loop evaluation verifies that errors do not compound across the full denoising loop. A port with passing Step 3 results can still fail open-loop if there is a dtype cast, attention bug, or noise schedule mismatch accumulating across steps.
 
 ```bash
 python <model_eval_script> \
@@ -587,7 +630,7 @@ python <model_eval_script> \
     --traj-ids 0 1 2
 ```
 
-Also run with HF reference model. Neuron MSE must be within 10% of HF reference MSE. If significantly higher, the port has a correctness problem. Fix before benchmarking.
+Also run with HF reference model on CPU. Neuron action MSE must be within 10% of HF reference MSE. If significantly higher, the port has a correctness problem — do not proceed to benchmark. Common causes: `--model-type=transformer` on a DiT (fix: use `-O1`), dtype cast accumulation (fix: verify BF16 throughout), wrong noise schedule (fix: verify timestep sequence matches reference).
 
 ### Step 4 — Benchmark
 
@@ -666,21 +709,41 @@ Verify: `python benchmark.py` prints latency numbers without error.
 
 ### Step 3 — Write `README.md`
 
-Must cover:
-1. One-command environment setup
-2. `python run_inference.py` with expected output
-3. `python benchmark.py` and how to interpret numbers
-4. How to recompile from scratch vs load pre-compiled
-5. Hardware requirements and Neuron SDK version pin
-6. tp_degree per subgraph — what was used and why
-7. Known deviations from HF reference with tolerances
-8. Input/output shapes and dtypes
+Replace any prior README.md with one matching this structure exactly:
 
-### Step 4 — Final verification
+1. **Header** — one-line model description + validation date
+2. **Hardware Requirements** — instance type, NeuronCore count, HBM, Neuron SDK version pin, AMI
+3. **Environment Setup** — single command to activate the venv
+4. **Architecture Overview** — ASCII diagram showing the full pipeline with tensor shapes at each subgraph boundary
+5. **Compiled NEFFs table** — columns: NEFF name, file size, TP degree, input shape(s), output shape(s)
+6. **Compile from Scratch** — exact commands with `--only` flags, `--force` flag, compilation time estimates for warm cache and cold cache
+7. **Run Inference** — Python API examples showing both Option A (load pre-compiled) and Option B (compile then run)
+8. **Benchmark** — per-subgraph table with mean latency and P95; end-to-end pipeline latency
+9. **Validate Correctness** — cos_sim table per subgraph; open-loop eval results (MSE vs HF reference)
+10. **Compiler Flags** — explain WHY each flag was chosen, not just what was used (include the DiT/ViT distinction and the `--model-type=transformer` warning)
+11. **TP Design Rationale** — head count math showing why the chosen tp_degree was selected
+12. **Known Deviations** — table of deviations with cos_sim impact per deviation
+13. **Directory Structure** — tree of the compiled artifact directory
+
+### Step 4 — Write `demo.ipynb`
+
+Produce a self-contained Jupyter notebook with these sections as markdown headers, each followed by runnable code cells. The notebook must run top-to-bottom on the Trainium instance after NEFFs are compiled. No placeholder cells.
+
+1. **Setup** — imports, path constants, `torch_neuronx` version check
+2. **Architecture Overview** — markdown only, ASCII diagram matching the README
+3. **Load Checkpoint and Inspect Weights** — load safetensors, print weight groups and key tensor shapes (confirm shapes match `config_constants.py`)
+4. **Compile Subgraphs** — skip-if-compiled check for each subgraph, then compile call; print estimated time
+5. **Load Compiled NEFFs** — `load_model()` call imported from `run_inference.py`
+6. **Sample Inference with Dummy Inputs** — full pipeline run with timing, shape assertion on output, NaN check
+7. **Benchmark** — warmup loop (20 iters discarded), measure loop (50 iters), numpy stats (mean, median, P95, std), print formatted table; include ViT CPU vs NEFF latency comparison if applicable
+8. **Correctness Validation** — `subprocess.run` call to `validate_neffs.py` and `open_loop_eval.py`, filter and display output
+
+### Step 5 — Final verification
 
 ```bash
 python run_inference.py
 python benchmark.py
+jupyter nbconvert --to notebook --execute demo.ipynb
 ```
 
 Update STATUS.md:
@@ -689,7 +752,8 @@ Update STATUS.md:
 ## Phase 6 — Complete
 - run_inference.py: verified working
 - benchmark.py: verified working
-- README.md: written
+- README.md: written (all 13 sections present)
+- demo.ipynb: all cells execute without error
 - Final benchmark: [end-to-end mean/p95]
 ```
 

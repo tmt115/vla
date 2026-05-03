@@ -525,7 +525,7 @@ class NeuronActionHeadBase(nn.Module):
         """
         return (
             "--auto-cast=none "
-            "--model-type=transformer "
+            "-O1 "
             "--tensorizer-options='"
             "--enable-ccop-compute-overlap "
             "--cc-pipeline-tiling-factor=1'"

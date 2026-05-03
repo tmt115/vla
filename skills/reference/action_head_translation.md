@@ -302,6 +302,28 @@ Key rules:
 
 ---
 
+## Part 4b: Compiler Args for DiT Subgraphs
+
+DiT subgraphs (denoising models, flow matching action heads) must use `-O1` only. Never use `--model-type=transformer` on a DiT.
+
+`--model-type=transformer` replaces the native softmax with a custom NKI kernel that is numerically inaccurate for DiT/FLUX-style attention. Verified effect: cosine similarity drops to 0.916, 37% mean error per step, unusable output.
+
+The correct default is set in `NeuronActionHeadBase.get_compiler_args()`:
+```python
+def get_compiler_args(self) -> str:
+    return (
+        "--auto-cast=none "
+        "-O1 "
+        "--tensorizer-options='"
+        "--enable-ccop-compute-overlap "
+        "--cc-pipeline-tiling-factor=1'"
+    )
+```
+
+If a subclass overrides `get_compiler_args()`, verify the override does not re-add `--model-type=transformer`.
+
+---
+
 ## Part 5: Gotchas
 
 **Dynamic iteration count** — `num_steps` must never enter the compiled graph as
