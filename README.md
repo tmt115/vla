@@ -6,6 +6,10 @@ This repository contains code for translating pytorch models onto trainium using
 
 The skill is centered around SKILL_Port. This is the overall skill which takes in the input and manages everything. It first dispatches an agent to explore the ecosystem and find information on the model. Then it gives this information to SKILL and translates the model. There is a bunch of other infrastructure in their to expand the NxDI infrastructure and provide the skill with special guidance for action heads. 
 
+## Next steps
+
+I would like to do a final run through to verify this before it is used further and packaged. I am thinking I will run it on pi0. In addition exploring the applicability of this to trn2/3 since all ports have been on trn1.32xlarge.
+
 ## Software Log
 
 ### Smol Ports 1 and 2
