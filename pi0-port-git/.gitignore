@@ -1,0 +1,24 @@
+# Compiled NEFFs (large binary files — recompile from source)
+compiled/
+
+# Checkpoint weights (download from HuggingFace: lerobot/pi0)
+weights/
+
+# neuronx-cc compiler artifacts
+neuronxcc-*/
+log-neuron-cc.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Test artifacts
+tests/artifacts/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Compilation logs
+notes/
